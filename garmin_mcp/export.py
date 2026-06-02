@@ -382,7 +382,8 @@ def download_activity_files(
 ):
     """Download original activity files (FIT, GPX, or TCX) from Garmin Connect.
 
-    Requires an active browser session (Playwright).
+    Requires Garmin credentials — authenticates via the GarminClient
+    (curl_cffi + OAuth) to fetch each activity's file.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 

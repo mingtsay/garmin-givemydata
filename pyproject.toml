@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "garmin-givemydata"
 version = "0.1.12"
-description = "Get your Garmin Connect data back. Browser-based extraction + 48-table SQLite database + MCP server for AI analysis."
+description = "Get your Garmin Connect data back. TLS-fingerprint extraction + 48-table SQLite database + MCP server for AI analysis."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "AGPL-3.0-only"
@@ -27,7 +27,7 @@ classifiers = [
     "Topic :: Database",
 ]
 dependencies = [
-    "seleniumbase>=4.30",
+    "curl_cffi>=0.7",
     "httpx>=0.25",
     "mcp[cli]>=1.0",
     "python-dotenv>=1.0",

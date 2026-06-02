@@ -32,7 +32,7 @@ from garmin_mcp.db import query as db_query
 
 
 def _get_data_dir() -> Path:
-    """Determine where to store data (DB, FIT files, .env, browser profile).
+    """Determine where to store data (DB, FIT files, .env, session tokens).
 
     Priority:
     1. GARMIN_DATA_DIR env var (explicit override)
@@ -355,7 +355,7 @@ examples:
     parser.add_argument(
         "--visible",
         action="store_true",
-        help="Show the browser window (default: headless). Useful for debugging login issues.",
+        help="Deprecated no-op (kept for compatibility); there is no browser to show.",
     )
 
     args = parser.parse_args()

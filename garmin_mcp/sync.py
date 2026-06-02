@@ -96,10 +96,9 @@ def incremental_sync(
     PROJECT_DIR = Path(__file__).parent.parent
     PROFILE_DIR = PROJECT_DIR / "browser_profile"
 
-    # When launched as an MCP server, the host's CWD may be a system path
-    # with no write access (e.g. C:\Windows\System32 on Windows). SeleniumBase
-    # creates downloaded_files/ relative to CWD, which then crashes the sync
-    # with PermissionError. Move into PROJECT_DIR. See issue #35.
+    # When launched as an MCP server, the host's CWD may be a system path with
+    # no write access (e.g. C:\Windows\System32 on Windows). Normalize to
+    # PROJECT_DIR so any relative paths resolve somewhere writable. See #35.
     os.chdir(str(PROJECT_DIR))
 
     env_file = PROJECT_DIR / ".env"

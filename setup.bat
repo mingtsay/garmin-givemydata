@@ -43,9 +43,9 @@ pip install --upgrade pip -q 2>nul
 pip install -r requirements.txt -q 2>nul
 echo        Dependencies installed
 
-REM ── Step 3: Verify Chrome ──
-echo [3/4] Verifying Chrome...
-echo        Chrome found — SeleniumBase will auto-download the matching chromedriver
+REM ── Step 3: Verify TLS engine ──
+echo [3/4] Verifying TLS engine...
+python -c "import curl_cffi" 2>nul && (echo        curl_cffi ready — no browser or chromedriver needed) || (echo   WARNING: curl_cffi failed to import. Check the pip output above.)
 
 REM ── Step 4: Garmin credentials ──
 echo [4/4] Garmin Connect credentials
@@ -84,8 +84,7 @@ echo.
 echo     venv\Scripts\activate.bat
 echo     python garmin_givemydata.py
 echo.
-echo   A Chrome window will open. If you have MFA enabled,
-echo   enter the code in the browser when prompted.
+echo   If you have MFA enabled, enter the code when prompted.
 echo.
 echo   First run fetches all history (~30 min).
 echo   After that, daily syncs take seconds.

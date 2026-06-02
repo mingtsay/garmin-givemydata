@@ -10,7 +10,7 @@ echo "  ╚═══════════════════════
 echo
 
 # ── Step 1: Check Python ──────────────────────────────────────
-echo "[1/5] Checking Python..."
+echo "[1/4] Checking Python..."
 
 PYTHON=""
 for cmd in python3.12 python3.11 python3.10 python3 python; do
@@ -38,33 +38,8 @@ if [ -z "$PYTHON" ]; then
     exit 1
 fi
 
-# ── Step 2: Check Chrome ──────────────────────────────────────
-echo "[2/5] Checking Google Chrome..."
-
-CHROME_FOUND=false
-if [ "$(uname)" = "Darwin" ]; then
-    [ -d "/Applications/Google Chrome.app" ] && CHROME_FOUND=true
-elif command -v google-chrome &>/dev/null || command -v google-chrome-stable &>/dev/null; then
-    CHROME_FOUND=true
-fi
-
-if [ "$CHROME_FOUND" = false ]; then
-    echo
-    echo "  WARNING: Google Chrome was not detected."
-    echo "  Chrome is required for authentication."
-    echo "  Install it from: https://www.google.com/chrome/"
-    echo
-    read -p "  Continue anyway? (y/N) " -n 1 -r
-    echo
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-        exit 1
-    fi
-else
-    echo "       Chrome found"
-fi
-
-# ── Step 3: Create venv + install deps ────────────────────────
-echo "[3/5] Setting up Python environment..."
+# ── Step 2: Create venv + install deps ────────────────────────
+echo "[2/4] Setting up Python environment..."
 
 if [ ! -d "venv" ]; then
     "$PYTHON" -m venv venv
@@ -75,12 +50,16 @@ pip install --upgrade pip -q 2>&1 | tail -1
 pip install -r requirements.txt -q 2>&1 | tail -1
 echo "       Dependencies installed"
 
-# ── Step 4: Verify Chrome is ready ────────────────────────────
-echo "[4/5] Verifying Chrome..."
-echo "       Chrome found — SeleniumBase will auto-download the matching chromedriver"
+# ── Step 3: Verify TLS engine ─────────────────────────────────
+echo "[3/4] Verifying TLS engine..."
+if python -c "import curl_cffi" 2>/dev/null; then
+    echo "       curl_cffi ready — no browser or chromedriver needed"
+else
+    echo "  WARNING: curl_cffi failed to import. Re-run after checking the pip output above."
+fi
 
-# ── Step 5: Garmin credentials ────────────────────────────────
-echo "[5/5] Garmin Connect credentials"
+# ── Step 4: Garmin credentials ────────────────────────────────
+echo "[4/4] Garmin Connect credentials"
 echo
 
 if [ -f ".env" ]; then
@@ -124,8 +103,7 @@ echo
 echo "    source venv/bin/activate"
 echo "    python garmin_givemydata.py"
 echo
-echo "  A Chrome window will open. If you have MFA enabled,"
-echo "  enter the code in the browser when prompted."
+echo "  If you have MFA enabled, enter the code when prompted."
 echo
 echo "  First run fetches all history (~30 min)."
 echo "  After that, daily syncs take seconds."

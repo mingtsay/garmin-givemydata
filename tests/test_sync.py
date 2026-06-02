@@ -10,11 +10,10 @@ PROJECT_DIR = Path(__file__).resolve().parent.parent
 
 
 class TestIncrementalSyncChdir(unittest.TestCase):
-    """Issue #35 bug 1: incremental_sync must chdir to PROJECT_DIR before
-    SeleniumBase launches. The host CWD when run as an MCP server can be
-    a system path with no write access (e.g. C:\\Windows\\System32 on
-    Windows), and SeleniumBase tries to create downloaded_files/ relative
-    to CWD, which crashes with PermissionError.
+    """Issue #35 bug 1: incremental_sync must chdir to PROJECT_DIR. The host
+    CWD when run as an MCP server can be a system path with no write access
+    (e.g. C:\\Windows\\System32 on Windows), so any relative path the sync
+    touches must resolve somewhere writable.
     """
 
     def setUp(self):

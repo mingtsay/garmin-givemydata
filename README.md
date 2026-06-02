@@ -54,7 +54,7 @@ setup.bat              # Windows
 garmin-givemydata                    # fetches all historical data + FIT files
 ```
 
-First run prompts for credentials, launches a headless browser, and fetches your full history (~30 min for 10 years). After that, daily syncs take seconds.
+First run prompts for credentials, authenticates over HTTPS (no browser), and fetches your full history (~30 min for 10 years). After that, daily syncs take seconds.
 
 ### Connect AI
 
@@ -298,15 +298,15 @@ garmin-givemydata --export-tcx ./tcx           # TCX (for TrainingPeaks)
 
 </details>
 
-### Browser engine
+### Auth engine
 
-Uses SeleniumBase UC mode (undetected Chrome) for Cloudflare bypass. Requires Google Chrome installed.
+Uses [`curl_cffi`](https://github.com/lexiforest/curl_cffi) with a pinned Chrome TLS fingerprint (JA3/JA4) to clear Cloudflare, then Garmin's mobile SSO + OAuth flow to mint a bearer token. No browser, no chromedriver, no Xvfb — just HTTPS. All data comes from `connectapi.garmin.com` (the host behind the web app's `/gc-api/` proxy) as plain JSON, so no page rendering is ever required.
 
-| Engine | Headless | Cloudflare bypass | Session lifetime |
-|--------|----------|-------------------|-----------------|
-| **SeleniumBase UC** (Chrome) | Yes (via Xvfb on Linux) | Yes | Weeks on stable IP |
+| Engine | Dependencies | Cloudflare bypass | Session lifetime |
+|--------|--------------|-------------------|-----------------|
+| **curl_cffi** (Chrome TLS) | ~5 MB, pure pip | Yes | OAuth token, auto-refreshed |
 
-**Note:** `cf_clearance` is bound to your IP address. If your IP changes, the session expires regardless of profile state. For unattended use, run on a machine with a stable egress IP.
+The OAuth2 token is cached and refreshed automatically from the long-lived OAuth1 token, so reruns skip the login. Pin a different Chrome fingerprint with the `GARMIN_IMPERSONATE` env var (e.g. `GARMIN_IMPERSONATE=chrome124`) if Garmin ever requires it. If your account has MFA, set `GARMIN_MFA_CODE` for non-interactive runs, or do the first login in a terminal.
 
 <details>
 <summary>Where data is stored</summary>
@@ -319,7 +319,7 @@ Uses SeleniumBase UC mode (undetected Chrome) for Cloudflare bypass. Requires Go
 
 ```
 garmin.db              # SQLite database (all health + activity data)
-browser_profile/       # Browser session (persists ~1 year)
+garmin_session.json    # Cached OAuth tokens (auto-refreshed)
 .env                   # Garmin credentials
 fit/                   # Original FIT files (lossless)
 ```
@@ -372,8 +372,8 @@ fit/                   # Original FIT files (lossless)
 ```
 garmin-givemydata/
 ├── garmin_givemydata.py       # Main entry: smart sync (full or incremental)
-├── garmin_client/              # SeleniumBase-based Garmin Connect client
-│   ├── client.py               #   GarminClient (login, fetch, export)
+├── garmin_client/              # curl_cffi-based Garmin Connect client
+│   ├── client.py               #   GarminClient (SSO/OAuth login, fetch, export)
 │   └── endpoints.py            #   API endpoint definitions
 ├── garmin_mcp/                 # MCP server + database layer
 │   ├── db.py                   #   SQLite schema (48 tables), upsert helpers
@@ -384,7 +384,7 @@ garmin-givemydata/
 ├── run_mcp.py                  # MCP server entry point
 ├── garmin.db                   # Your health data (SQLite, gitignored)
 ├── fit/                        # Your activity files (FIT/ZIP, gitignored)
-├── browser_profile/            # Browser session (gitignored)
+├── garmin_session.json         # Cached OAuth tokens (gitignored)
 └── pyproject.toml
 ```
 
@@ -405,9 +405,9 @@ SQLite ──→ MCP server (AI queries via 45 tools)
 | Platform | Status | Notes |
 |----------|--------|-------|
 | **macOS** | Tested | Primary development platform |
-| **Linux (Ubuntu/Debian/Fedora)** | Supported | Needs Chrome + optional `xvfb` for headless SSH |
+| **Linux (Ubuntu/Debian/Fedora)** | Supported | No browser needed — pure HTTPS |
 | **Windows 10/11** | Supported | Use PowerShell or Command Prompt |
-| **WSL2** | Supported | Works headless with Xvfb |
+| **WSL2** | Supported | Works out of the box |
 
 <details>
 <summary>Manual setup (if setup script doesn't work)</summary>
@@ -421,7 +421,6 @@ cd garmin-givemydata
 python3.12 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
-# Chrome must be installed (https://www.google.com/chrome/)
 cp .env.example .env
 ```
 </details>
@@ -435,7 +434,6 @@ cd garmin-givemydata
 python3.12 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
-# Chrome must be installed (https://www.google.com/chrome/)
 cp .env.example .env
 ```
 </details>
@@ -449,7 +447,6 @@ cd garmin-givemydata
 python3.12 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
-# Chrome must be installed (https://www.google.com/chrome/)
 cp .env.example .env
 ```
 </details>
@@ -464,7 +461,6 @@ cd garmin-givemydata
 python -m venv venv
 venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-# Chrome must be installed (https://www.google.com/chrome/)
 copy .env.example .env
 ```
 
@@ -478,19 +474,15 @@ If PowerShell blocks the activate script: `Set-ExecutionPolicy -ExecutionPolicy 
 <details>
 <summary>Common issues and fixes</summary>
 
-**"Login failed"**: Delete the browser profile and run again. For pip/brew: `rm -rf ~/.garmin-givemydata/browser_profile`. For git clone: `rm -rf browser_profile/`.
+**"Login failed"**: Delete the cached token and run again. For pip/brew: `rm -f ~/.garmin-givemydata/garmin_session.json`. For git clone: `rm -f garmin_session.json`. Double-check the credentials in `.env`.
 
-**Script crashed**: Don't close the Chrome window manually. The tool handles shutdown — killing Chrome mid-run corrupts the profile. Run again (stale locks are auto-cleaned).
+**MFA / "non-interactive" errors**: If your account has multi-factor auth, complete the first login in a terminal (you'll be prompted for the code), or set `GARMIN_MFA_CODE` before an unattended run. After the first success the token is cached and refreshed automatically.
 
 **"Python not found"**: Make sure Python 3.10+ is on your PATH. macOS: `brew install python@3.12`. Ubuntu: `sudo apt install python3.12 python3.12-venv`.
 
 **`ensurepip is not available` / venv creation fails**: Your system Python is missing the venv module. Install the matching package: `sudo apt install python3.X-venv` (replace `X` with your minor version — `python3 --version` to check). On Ubuntu with Python 3.14, that's `python3.14-venv`. The `setup.sh` script auto-detects Python but can't auto-install the venv package.
 
-**403 or session errors**: Session expired (often from IP change — `cf_clearance` is IP-bound). Delete the browser profile and re-login.
-
-**Chrome doesn't open (Linux/SSH)**: Install Xvfb: `sudo apt install xvfb`. The tool auto-spawns Xvfb at 1920x1080 when no display is available, or use `xvfb-run -a garmin-givemydata`.
-
-**Session rot over SSH**: Run under `systemd-run --user --scope` or `tmux`/`screen` so SSH disconnect doesn't SIGHUP the process. The tool installs signal handlers but a detached session is more reliable.
+**403 or "Cloudflare" errors**: Garmin may have shifted its bot detection to a newer Chrome fingerprint. Pin a different one with `GARMIN_IMPERSONATE=chrome124` (or another version) and retry.
 
 **MCP server "failed to connect"**: Paths in `.mcp.json` must be **absolute**. Test: `<path>/venv/bin/python <path>/run_mcp.py`
 
@@ -522,13 +514,13 @@ If PowerShell blocks the activate script: `Set-ExecutionPolicy -ExecutionPolicy 
 <details>
 <summary>How to help</summary>
 
-- **New endpoints**: Garmin has hundreds of internal APIs. Discover new ones via browser dev tools and add them to `endpoints.py`.
+- **New endpoints**: Garmin has hundreds of internal APIs. Discover new ones via browser dev tools (watch the `/gc-api/` XHRs) and add them to `endpoints.py`.
 - **More MCP tools**: The server has 45 tools including CTL/ATL/TSB, recovery signatures, and period comparison. Ideas: injury risk prediction, sleep optimization, race readiness scoring, overtraining detection.
 - **MCP client integrations**: Test with OpenClaw, Cline, Continue, Cursor, or other clients.
 - **Other platforms**: ARM (Raspberry Pi), Docker, etc.
 - **Data visualization**: Dashboards, charts, reports from SQLite.
 - **Export formats**: Parquet, or other formats for pandas, R.
-- **Other wearables**: The architecture (browser auth + SQLite + MCP) could work for COROS, Samsung, Amazfit/Zepp.
+- **Other wearables**: The architecture (TLS-fingerprint auth + SQLite + MCP) could work for COROS, Samsung, Amazfit/Zepp.
 - **Testing**: Tests, CI, more platform support.
 
 Open an issue or submit a PR.

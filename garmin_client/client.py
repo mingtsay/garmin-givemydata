@@ -1,32 +1,48 @@
 """
-Garmin Connect Client using SeleniumBase (UC mode) for authentication and data fetching.
+Garmin Connect client using curl_cffi (Chrome TLS impersonation) for
+Cloudflare bypass + the Garmin mobile SSO/OAuth flow for authentication.
 
-Uses undetected-chromedriver via SeleniumBase to bypass Cloudflare bot detection
-on Garmin Connect.  All API calls go through the browser context via
-``execute_async_script`` so the TLS fingerprint, cookies, and CSRF tokens are
-always consistent — the only pattern confirmed working as of April 2026
-(see matin/garth#225).
+Replaces the previous SeleniumBase / undetected-Chrome implementation:
+no browser, no chromedriver, no Xvfb, no on-disk Chrome profile.
+
+How it works
+------------
+* ``curl_cffi`` reproduces a real Chrome TLS fingerprint (JA3/JA4) so
+  Cloudflare lets the plain HTTPS requests through — the same trick the
+  browser used to provide, minus the ~400 MB of Chrome.
+* Authentication uses Garmin's mobile SSO JSON API
+  (``sso.garmin.com/mobile/api/login``) to obtain a service ticket, then
+  the standard two-step OAuth exchange (OAuth1 ``preauthorized`` →
+  OAuth2 ``exchange``) to mint a bearer token.  This is the same flow the
+  ``garth`` library uses.
+* All data is fetched from ``connectapi.garmin.com`` — the API host that
+  backs the web app's ``/gc-api/`` proxy — with the OAuth2 bearer token.
+  Every endpoint returns JSON (REST + GraphQL), so **no page rendering /
+  SPA / JS engine is ever required**.
+
+OAuth2 tokens are cached to disk and refreshed automatically from the
+long-lived OAuth1 token, so subsequent runs skip the interactive login.
 """
 
 import atexit
+import base64
+import hashlib
+import hmac
 import json
 import logging
 import os as _os
-import shutil
+import secrets
 import signal
 import sys
 import threading
 import time
+from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional
+from urllib.parse import parse_qs, parse_qsl, quote, urlparse
 
-from selenium.webdriver.common.action_chains import ActionChains
-from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import WebDriverWait
-from seleniumbase import Driver
+from curl_cffi import requests as cffi_requests
 
 from .endpoints import (
     activities_search_url,
@@ -45,27 +61,150 @@ log = logging.getLogger(__name__)
 
 DEFAULT_PROFILE_DIR = Path.home() / ".garmin-client" / "browser_profile"
 
-CONNECT_URL = "https://connect.garmin.com/app/"
-SSO_LOGIN_URL = (
-    "https://sso.garmin.com/portal/sso/en-US/sign-in"
-    "?clientId=GarminConnect"
-    "&service=https%3A%2F%2Fconnect.garmin.com%2Fapp"
-)
+# ── Hosts ────────────────────────────────────────────────────────
+SSO_BASE = "https://sso.garmin.com"
+CONNECTAPI_BASE = "https://connectapi.garmin.com"
+GRAPHQL_URL = f"{CONNECTAPI_BASE}/graphql-gateway/graphql"
 
-CSRF_TTL = 1800  # 30 minutes — re-read meta tag after this
-_XVFB_SCREEN = "1920x1080x24"
-_SENTINEL = ".garmin_clean_exit"
+# ── SSO / OAuth flow constants (mirrors garth) ───────────────────
+CLIENT_ID = "GCM_ANDROID_DARK"
+SERVICE_URL = "https://mobile.integration.garmin.com/gcm/android"
+OAUTH_CONSUMER_URL = "https://thegarth.s3.amazonaws.com/oauth_consumer.json"
+# Fallback if the S3 consumer manifest is unreachable. These are the
+# long-lived public Garmin Connect Mobile OAuth consumer credentials.
+OAUTH_CONSUMER_FALLBACK = {
+    "consumer_key": "fc3e99d2-118c-44b8-8ae3-03370dde24c0",
+    "consumer_secret": "E08WAR897WEy2knn7aFBrvegVAf0AFdWBBF",
+}
+
+SSO_SUCCESSFUL = "SUCCESSFUL"
+SSO_MFA_REQUIRED = "MFA_REQUIRED"
+
+# Pinned Chrome impersonation target. curl_cffi's bare "chrome" alias can
+# float to whichever version ships with the library; we pin a specific
+# version for a stable, predictable TLS fingerprint. Override via the
+# GARMIN_IMPERSONATE env var if Garmin ever requires a newer fingerprint.
+DEFAULT_IMPERSONATE = "chrome131"
+
+# User-Agents per call class (matches garth's proven choices).
+SSO_USER_AGENT = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
+)
+OAUTH_USER_AGENT = "com.garmin.android.apps.connectmobile"
+API_USER_AGENT = "GCM-iOS-5.22.1.4"
+
+SSO_PAGE_HEADERS = {
+    "User-Agent": SSO_USER_AGENT,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Dest": "document",
+}
+
+# Refresh the OAuth2 token this many seconds before it actually expires so
+# a long batch never races the expiry.
+TOKEN_REFRESH_BUFFER = 120
+# Number of concurrent HTTP requests per batch.
+DEFAULT_CONCURRENCY = 10
+REQUEST_TIMEOUT = 60
+DOWNLOAD_TIMEOUT = 120
+
+
+# ─── OAuth1 signing (RFC 5849, HMAC-SHA1) ────────────────────────
+
+
+def _pe(value) -> str:
+    """RFC 3986 percent-encoding used by OAuth1."""
+    return quote(str(value), safe="~")
+
+
+def oauth1_authorization_header(
+    method: str,
+    url: str,
+    consumer_key: str,
+    consumer_secret: str,
+    token: Optional[str] = None,
+    token_secret: Optional[str] = None,
+    body_params: Optional[dict] = None,
+    nonce: Optional[str] = None,
+    timestamp: Optional[int] = None,
+) -> str:
+    """Build an ``Authorization: OAuth ...`` header (HMAC-SHA1).
+
+    Query-string params (parsed from ``url``) and form ``body_params`` are
+    both folded into the signature base string, per the spec.  ``nonce`` and
+    ``timestamp`` are generated when omitted (overridable for tests).
+    """
+    parsed = urlparse(url)
+    base_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+
+    params: dict = {}
+    for k, v in parse_qsl(parsed.query, keep_blank_values=True):
+        params[k] = v
+    if body_params:
+        params.update(body_params)
+
+    oauth = {
+        "oauth_consumer_key": consumer_key,
+        "oauth_nonce": nonce or secrets.token_hex(16),
+        "oauth_signature_method": "HMAC-SHA1",
+        "oauth_timestamp": str(timestamp if timestamp is not None else int(time.time())),
+        "oauth_version": "1.0",
+    }
+    if token:
+        oauth["oauth_token"] = token
+
+    all_params = {**params, **oauth}
+    encoded = sorted((_pe(k), _pe(v)) for k, v in all_params.items())
+    normalized = "&".join(f"{k}={v}" for k, v in encoded)
+    base_string = "&".join([method.upper(), _pe(base_url), _pe(normalized)])
+    signing_key = f"{_pe(consumer_secret)}&{_pe(token_secret or '')}"
+    signature = base64.b64encode(hmac.new(signing_key.encode(), base_string.encode(), hashlib.sha1).digest()).decode()
+    oauth["oauth_signature"] = signature
+
+    return "OAuth " + ", ".join(f'{_pe(k)}="{_pe(v)}"' for k, v in sorted(oauth.items()))
+
+
+# ─── Token dataclasses ───────────────────────────────────────────
+
+
+@dataclass
+class OAuth1Token:
+    oauth_token: str
+    oauth_token_secret: str
+    mfa_token: Optional[str] = None
+
+
+@dataclass
+class OAuth2Token:
+    access_token: str
+    refresh_token: str = ""
+    token_type: str = "Bearer"
+    expires_in: int = 0
+    expires_at: int = 0
+    refresh_token_expires_in: int = 0
+    refresh_token_expires_at: int = 0
+    scope: str = ""
+    jti: str = ""
+
+    @property
+    def expired(self) -> bool:
+        return self.expires_at <= time.time() + TOKEN_REFRESH_BUFFER
+
+    def authorization(self) -> str:
+        return f"{(self.token_type or 'Bearer').title()} {self.access_token}"
 
 
 # ─── Process lifecycle ───────────────────────────────────────────
 
 
 class _ProcessLifecycle:
-    """Ensures clean browser shutdown on SIGHUP, SIGTERM, SIGINT, and atexit.
+    """Ensures clean shutdown (token flush) on SIGHUP, SIGTERM, SIGINT, atexit.
 
-    SSH disconnects send SIGHUP to the child process.  Without this handler
-    Chrome dies mid-IndexedDB-write and the profile state is torn — exactly
-    the failure mode that causes issue #11's session rot.
+    Kept from the SeleniumBase era because the MCP server still relies on
+    cleanup firing when an SSH session drops (SIGHUP) — now it just flushes
+    the OAuth token cache and closes the HTTP sessions instead of tearing
+    down a Chrome profile.
     """
 
     def __init__(self, cleanup_fn):
@@ -110,653 +249,409 @@ class GarminClient:
         profile_dir: Optional[Path] = None,
         headless: bool = False,
         session_file: Optional[Path] = None,
-        **_kwargs,  # absorb legacy engine= kwarg
+        **_kwargs,  # absorb legacy engine=/headless= kwargs
     ):
         self.email = email
         self.password = password
+        # profile_dir is retained for backward-compat (callers still pass it)
+        # and now holds the OAuth token cache instead of a Chrome profile.
         self.profile_dir = profile_dir or DEFAULT_PROFILE_DIR
         self.profile_dir.mkdir(parents=True, exist_ok=True)
+        # headless is a no-op now (no browser) but kept in the signature.
         self.headless = headless
         self.session_file = session_file
-        self._driver = None
-        self._csrf: Optional[str] = None
-        self._csrf_time: float = 0
+        self.token_file = session_file or (self.profile_dir / "oauth_tokens.json")
+
+        self.impersonate = _os.environ.get("GARMIN_IMPERSONATE", DEFAULT_IMPERSONATE)
+        self._consumer: Optional[dict] = None
+        self._oauth1: Optional[OAuth1Token] = None
+        self._oauth2: Optional[OAuth2Token] = None
         self._display_name: Optional[str] = None
+
+        self._session: Optional[cffi_requests.Session] = None  # serial use (login/api_fetch/download)
+        self._pool = None  # ThreadPoolExecutor for batch fetches (lazy)
+        self._tlocal = threading.local()  # per-thread sessions for the pool
+        self._pool_sessions: list = []
+        self._pool_sessions_lock = threading.Lock()
+
         self._lifecycle: Optional[_ProcessLifecycle] = None
-        self._xvfb_proc = None
-        self._xvfb_display = None
-        self._xvfb_prev_display = None
         self._save_raw_enabled = False
 
-    # ── Display management ───────────────────────────────────────
+    # ── Sessions ─────────────────────────────────────────────────
 
-    def _spawn_xvfb(self) -> Optional[str]:
-        """Spawn Xvfb at a realistic size and return its ``:N`` display string."""
-        import subprocess
+    def _new_session(self) -> "cffi_requests.Session":
+        return cffi_requests.Session(impersonate=self.impersonate)
 
-        xvfb = shutil.which("Xvfb")
-        if not xvfb:
-            return None
+    def _serial_session(self) -> "cffi_requests.Session":
+        if self._session is None:
+            self._session = self._new_session()
+        return self._session
 
-        chosen = None
-        for n in range(99, 200):
-            if not Path(f"/tmp/.X{n}-lock").exists():
-                chosen = n
-                break
-        if chosen is None:
-            log.debug("No free Xvfb display slots in :99-:199")
-            return None
+    def _pool_session(self) -> "cffi_requests.Session":
+        """Thread-local session so pooled workers reuse connections safely."""
+        s = getattr(self._tlocal, "session", None)
+        if s is None:
+            s = self._new_session()
+            self._tlocal.session = s
+            with self._pool_sessions_lock:
+                self._pool_sessions.append(s)
+        return s
 
-        display = f":{chosen}"
+    def _auth_headers(self) -> dict:
+        return {
+            "Authorization": self._oauth2.authorization(),
+            "User-Agent": API_USER_AGENT,
+            "Accept": "application/json",
+        }
+
+    # ── Consumer key ─────────────────────────────────────────────
+
+    def _ensure_consumer(self) -> dict:
+        if self._consumer:
+            return self._consumer
         try:
-            self._xvfb_proc = subprocess.Popen(
-                [
-                    xvfb,
-                    display,
-                    "-screen",
-                    "0",
-                    _XVFB_SCREEN,
-                    "-ac",
-                    "-nolisten",
-                    "tcp",
-                    "+extension",
-                    "RANDR",
-                    "+extension",
-                    "GLX",
-                    "+extension",
-                    "RENDER",
-                    "+extension",
-                    "COMPOSITE",
-                ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                close_fds=True,
-                start_new_session=True,
-            )
+            r = self._serial_session().get(OAUTH_CONSUMER_URL, timeout=REQUEST_TIMEOUT)
+            if r.status_code == 200:
+                data = r.json()
+                if data.get("consumer_key") and data.get("consumer_secret"):
+                    self._consumer = data
+                    return self._consumer
         except Exception as e:
-            log.debug("Failed to spawn Xvfb: %s", e)
-            return None
+            log.debug("Could not fetch OAuth consumer from S3: %s", e)
+        log.debug("Using fallback OAuth consumer credentials")
+        self._consumer = dict(OAUTH_CONSUMER_FALLBACK)
+        return self._consumer
 
-        for _ in range(20):
-            if self._xvfb_proc.poll() is not None:
-                log.debug("Xvfb exited immediately, rc=%s", self._xvfb_proc.returncode)
-                self._xvfb_proc = None
-                return None
-            if Path(f"/tmp/.X{chosen}-lock").exists():
-                break
-            time.sleep(0.1)
+    # ── Token persistence ────────────────────────────────────────
 
-        self._xvfb_display = display
-        log.info("Spawned Xvfb on %s (%s)", display, _XVFB_SCREEN)
-        return display
-
-    def _stop_xvfb(self) -> None:
-        """Restore $DISPLAY and stop any Xvfb we spawned."""
-        if self._xvfb_prev_display is None:
-            _os.environ.pop("DISPLAY", None)
-        else:
-            _os.environ["DISPLAY"] = self._xvfb_prev_display
-        self._xvfb_prev_display = None
-        self._xvfb_display = None
-        if self._xvfb_proc is not None:
-            try:
-                self._xvfb_proc.terminate()
-                try:
-                    self._xvfb_proc.wait(timeout=3)
-                except Exception:
-                    self._xvfb_proc.kill()
-            except Exception as e:
-                log.debug("Error stopping Xvfb: %s", e)
-            self._xvfb_proc = None
-
-    # ── Profile management ───────────────────────────────────────
-
-    def _cleanup_stale_locks(self) -> None:
-        """Remove Chrome profile lock files left behind by unclean exits."""
-        for name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
-            p = self.profile_dir / name
-            try:
-                if p.exists() or p.is_symlink():
-                    p.unlink()
-                    log.debug("Removed stale Chrome lock: %s", p)
-            except Exception as e:
-                log.debug("Could not remove lock %s: %s", p, e)
-
-    def _write_sentinel(self) -> None:
-        """Write a clean-exit sentinel after successful browser shutdown."""
+    def _save_tokens(self) -> None:
+        if not (self._oauth1 and self._oauth2):
+            return
+        payload = {
+            "oauth1": asdict(self._oauth1),
+            "oauth2": asdict(self._oauth2),
+            "saved_at": time.time(),
+        }
         try:
-            (self.profile_dir / _SENTINEL).write_text(str(time.time()))
-        except Exception:
-            pass
+            self.token_file.parent.mkdir(parents=True, exist_ok=True)
+            fd = _os.open(str(self.token_file), _os.O_WRONLY | _os.O_CREAT | _os.O_TRUNC, 0o600)
+            with _os.fdopen(fd, "w") as f:
+                json.dump(payload, f, indent=2)
+            log.debug("Saved OAuth tokens to %s", self.token_file)
+        except Exception as e:
+            log.debug("Could not save tokens: %s", e)
 
-    def _check_sentinel(self) -> bool:
-        """Check if last exit was clean. Returns True if clean, False if dirty."""
-        sentinel = self.profile_dir / _SENTINEL
-        if sentinel.exists():
-            try:
-                sentinel.unlink()
-            except Exception:
-                pass
+    def _load_tokens(self) -> bool:
+        if not self.token_file or not self.token_file.exists():
+            return False
+        try:
+            payload = json.loads(self.token_file.read_text())
+            o1 = payload.get("oauth1")
+            o2 = payload.get("oauth2")
+            if not o1 or not o2:
+                return False
+            self._oauth1 = OAuth1Token(
+                oauth_token=o1["oauth_token"],
+                oauth_token_secret=o1["oauth_token_secret"],
+                mfa_token=o1.get("mfa_token"),
+            )
+            known = OAuth2Token.__dataclass_fields__.keys()
+            self._oauth2 = OAuth2Token(**{k: v for k, v in o2.items() if k in known})
+            log.info("Restored OAuth tokens from %s", self.token_file)
             return True
-        return False
-
-    def _load_legacy_session(self) -> None:
-        """Import cookies from legacy session.json if profile is fresh."""
-        if not self.session_file or not self.session_file.exists():
-            return
-        default_dir = self.profile_dir / "Default"
-        if default_dir.exists() and any(default_dir.iterdir()):
-            return
-        try:
-            session = json.loads(self.session_file.read_text())
-            age_days = (time.time() - session.get("saved_at", 0)) / 86400
-            if age_days >= 364 or not session.get("cookies"):
-                return
-            self._driver.get("https://connect.garmin.com")
-            time.sleep(1)
-            count = 0
-            for cookie in session["cookies"]:
-                if "expires" in cookie:
-                    cookie["expiry"] = int(cookie.pop("expires"))
-                cookie.pop("size", None)
-                try:
-                    self._driver.add_cookie(cookie)
-                    count += 1
-                except Exception:
-                    pass
-            log.info("Migrated %d legacy cookies from session.json", count)
         except Exception as e:
-            log.debug("Legacy session migration failed: %s", e)
-
-    def _save_session(self) -> None:
-        """Export Garmin cookies to JSON as a portable backup."""
-        if not self.session_file:
-            return
-        try:
-            cookies = self._driver.get_cookies()
-        except Exception:
-            return
-        garmin_cookies = [c for c in cookies if "garmin" in c.get("domain", "")]
-        if not garmin_cookies:
-            return
-        session = {"cookies": garmin_cookies, "saved_at": time.time()}
-        fd = _os.open(str(self.session_file), _os.O_WRONLY | _os.O_CREAT | _os.O_TRUNC, 0o600)
-        with _os.fdopen(fd, "w") as f:
-            json.dump(session, f, indent=2)
-        log.info("Session saved: %d cookies to %s", len(garmin_cookies), self.session_file)
-
-    # ── Browser launch ───────────────────────────────────────────
-
-    def _launch_browser(self) -> None:
-        """Launch SeleniumBase UC Chrome with appropriate display settings."""
-        self._cleanup_stale_locks()
-
-        use_headless2 = False
-
-        if self.headless:
-            if sys.platform.startswith("linux") and not _os.environ.get("DISPLAY"):
-                # No display (SSH/server) — spawn Xvfb and run headed against it
-                # for better stealth than Chrome's headless mode.
-                display = self._spawn_xvfb()
-                if display:
-                    self._xvfb_prev_display = _os.environ.get("DISPLAY")
-                    _os.environ["DISPLAY"] = display
-                else:
-                    log.warning(
-                        "No display and Xvfb not found (apt install xvfb). "
-                        "Falling back to headless mode (more detectable)."
-                    )
-                    use_headless2 = True
-            else:
-                # Desktop or macOS/Windows — use Chrome's new headless mode
-                use_headless2 = True
-
-        driver_kwargs = dict(
-            uc=True,
-            user_data_dir=str(self.profile_dir),
-            locale_code="en-US",
-        )
-        if use_headless2:
-            driver_kwargs["headless2"] = True
-
-        try:
-            self._driver = Driver(**driver_kwargs)
-        except Exception:
-            self._stop_xvfb()
-            raise
-
-        self._driver.set_script_timeout(120)
-
-        last_exit_clean = self._check_sentinel()
-        if not last_exit_clean:
-            log.info("Previous exit was unclean — profile may need warm-up")
-
-        self._load_legacy_session()
-
-        self._lifecycle = _ProcessLifecycle(self.close)
-        self._lifecycle.install()
-
-        log.info("Browser engine: SeleniumBase UC (Chrome)")
-
-    # ── Browser helpers ──────────────────────────────────────────
-
-    def _uc_navigate(self, url: str, reconnect_time: int = 10) -> None:
-        """Navigate to a URL with Cloudflare bypass (disconnects CDP briefly)."""
-        self._driver.uc_open_with_reconnect(url, reconnect_time)
-        try:
-            WebDriverWait(self._driver, 15).until(
-                lambda d: d.execute_script("return document.readyState") == "complete"
-            )
-        except Exception:
-            pass
-
-    def _type_slowly(self, text: str, delay_s: float = 0.03) -> None:
-        """Type text with delays between keystrokes for stealth."""
-        actions = ActionChains(self._driver)
-        for char in text:
-            actions.send_keys(char)
-            actions.pause(delay_s)
-        actions.perform()
+            log.debug("Could not load tokens (will re-login): %s", e)
+            self._oauth1 = None
+            self._oauth2 = None
+            return False
 
     # ── Login flow ───────────────────────────────────────────────
 
     def login(self, timeout_ms: int = 600000) -> bool:
-        self._launch_browser()
+        """Authenticate. Restores a cached session when possible, otherwise
+        runs the full SSO + OAuth login. Returns True on success."""
+        self._lifecycle = _ProcessLifecycle(self.close)
+        self._lifecycle.install()
 
-        log.debug("Navigating to %s", CONNECT_URL)
-        try:
-            self._uc_navigate(CONNECT_URL, 12)
-        except Exception as e:
-            log.debug("Initial navigation error (expected for fresh profile): %s", e)
-        time.sleep(3)
-
-        log.debug("URL after initial navigation: %s", self._driver.current_url)
-
-        if not self._is_on_login_page():
-            setup_ok = self._post_login_setup()
-            if setup_ok:
-                print("Already logged in (session restored)")
-                self._save_session()
-                return True
-            # If we are on a connect page but CSRF failed, don't clear cookies yet.
-            # Just try one navigation to /modern/ to see if it wakes up.
-            log.debug("On app page but no CSRF — attempting to refresh context")
+        # 1. Try to restore a cached session.
+        if self._load_tokens():
             try:
-                self._uc_navigate(CONNECT_URL, 12)
-                time.sleep(3)
-                if self._post_login_setup():
-                    print("Already logged in (session restored after refresh)")
-                    self._save_session()
+                if self._ensure_oauth2() and self._fetch_display_name():
+                    print("Already logged in (session restored)")
                     return True
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("Session restore failed, falling back to login: %s", e)
 
+        # 2. Full interactive login.
         print("Logging in...")
-
-        # Only clear cookies if we are on the SSO login page (fresh login needed)
-        if self._is_on_login_page():
-            try:
-                self._driver.delete_all_cookies()
-                log.debug("Cleared stale cookies for fresh login")
-            except Exception as e:
-                log.debug("Cookie clear error: %s", e)
-
-        for attempt in range(3):
-            try:
-                self._uc_navigate(SSO_LOGIN_URL, 12)
-                break
-            except Exception as e:
-                log.debug("SSO navigation attempt %d error: %s", attempt + 1, e)
-                time.sleep(3)
-
-        time.sleep(2)
-        log.debug("SSO page URL: %s", self._driver.current_url)
-
-        # Wait for login form
         try:
-            email_input = WebDriverWait(self._driver, 15).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, 'input[name="email"]'))
-            )
-        except Exception:
-            log.error("Login form not found on page: %s", self._driver.current_url)
-            try:
-                body = self._driver.execute_script("return document.body?.innerText?.substring(0, 500)")
-                print(f"Login form not found. Current URL: {self._driver.current_url}")
-                print(f"Page content: {body}")
-            except Exception:
-                print(f"Login form not found. Current URL: {self._driver.current_url}")
-            print("Try running with --visible or deleting browser_profile/")
+            ticket = self._sso_get_ticket()
+        except Exception as e:
+            log.error("SSO login failed: %s", e)
+            print(f"Login failed: {e}")
+            return False
+        if not ticket:
             return False
 
-        email_input.click()
-        self._type_slowly(self.email, delay_s=0.03)
-
         try:
-            pwd_input = WebDriverWait(self._driver, 5).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, 'input[name="password"]'))
-            )
-        except Exception:
-            log.error("Password field not found")
+            self._complete_oauth(ticket)
+        except Exception as e:
+            log.error("OAuth exchange failed: %s", e)
+            print(f"Login failed during OAuth exchange: {e}")
             return False
 
-        pwd_input.click()
-        self._type_slowly(self.password, delay_s=0.03)
+        self._save_tokens()
+        print("Login successful!")
+        if not self._fetch_display_name():
+            log.warning("Logged in but could not read social profile")
+        return True
 
-        # Auto-check "Remember Me"
+    def _sso_get_ticket(self) -> Optional[str]:
+        """Run the mobile SSO flow and return a service ticket (ST-...)."""
+        sess = self._serial_session()
+        login_params = {"clientId": CLIENT_ID, "locale": "en-US", "service": SERVICE_URL}
+
+        # Prime cookies with the sign-in page.
+        sess.get(
+            f"{SSO_BASE}/mobile/sso/en/sign-in",
+            params={"clientId": CLIENT_ID},
+            headers={**SSO_PAGE_HEADERS, "Sec-Fetch-Site": "none"},
+            timeout=REQUEST_TIMEOUT,
+        )
+
+        resp = sess.post(
+            f"{SSO_BASE}/mobile/api/login",
+            params=login_params,
+            headers=SSO_PAGE_HEADERS,
+            json={"username": self.email, "password": self.password, "rememberMe": True, "captchaToken": ""},
+            timeout=REQUEST_TIMEOUT,
+        )
+        data = self._json_or_none(resp)
+        if data is None:
+            print(f"Unexpected login response (HTTP {resp.status_code}). Check credentials.")
+            return None
+
+        status = (data.get("responseStatus") or {}).get("type")
+
+        if status == SSO_MFA_REQUIRED:
+            mfa_info = data.get("customerMfaInfo") or {}
+            mfa_method = mfa_info.get("mfaLastMethodUsed") or "email"
+            code = self._prompt_mfa()
+            if not code:
+                print("MFA required but no code was provided.")
+                return None
+            resp = sess.post(
+                f"{SSO_BASE}/mobile/api/mfa/verifyCode",
+                params=login_params,
+                headers=SSO_PAGE_HEADERS,
+                json={
+                    "mfaMethod": mfa_method,
+                    "mfaVerificationCode": code,
+                    "rememberMyBrowser": True,
+                    "reconsentList": [],
+                    "mfaSetup": False,
+                },
+                timeout=REQUEST_TIMEOUT,
+            )
+            data = self._json_or_none(resp)
+            status = (data or {}).get("responseStatus", {}).get("type")
+
+        if status != SSO_SUCCESSFUL:
+            msg = (data or {}).get("responseStatus", {}).get("message", status)
+            print(f"Login failed: {msg}")
+            return None
+
+        ticket = data.get("serviceTicketId")
+        if not ticket:
+            print("Login succeeded but no service ticket was returned.")
+            return None
+
+        # Best-effort embed call (sets a Cloudflare LB cookie).
         try:
-            self._driver.execute_script("""
-                var cb = document.querySelector('input[name="remember"], input[id="remember"]');
-                if (cb && !cb.checked) cb.click();
-            """)
+            sess.get(
+                f"{SSO_BASE}/portal/sso/embed",
+                headers={**SSO_PAGE_HEADERS, "Sec-Fetch-Site": "same-origin"},
+                timeout=REQUEST_TIMEOUT,
+            )
         except Exception:
             pass
 
-        try:
-            submit = self._driver.find_element(By.CSS_SELECTOR, 'button[type="submit"]')
-            submit.click()
-        except Exception:
-            ActionChains(self._driver).send_keys(Keys.ENTER).perform()
+        return ticket
 
-        print("Credentials submitted, waiting for Garmin...")
-
-        # Poll until we leave SSO
-        max_polls = timeout_ms // 1000
-        mfa_prompted = False
-        mfa_code_thread = None
-        mfa_code_result = [None]
-
-        for poll in range(max_polls):
-            time.sleep(1)
+    def _prompt_mfa(self) -> Optional[str]:
+        """Get an MFA code: env var first (for automation), then console."""
+        env_code = _os.environ.get("GARMIN_MFA_CODE")
+        if env_code:
+            log.info("Using MFA code from GARMIN_MFA_CODE")
+            return env_code.strip()
+        if sys.stdin.isatty():
+            print()
+            print("  MFA required!")
             try:
-                url = self._driver.current_url
-            except Exception:
-                continue
-
-            if poll % 5 == 0:
-                log.debug("Poll %d: URL = %s", poll, url)
-
-            # Success: we left SSO
-            if "connect.garmin.com" in url and "sso.garmin.com" not in url:
-                log.info("Login redirect detected: %s", url)
-                break
-
-            # Check other tabs (Garmin sometimes opens app in a new tab after MFA)
-            handles = self._driver.window_handles
-            if len(handles) > 1:
-                original = self._driver.current_window_handle
-                for handle in handles:
-                    self._driver.switch_to.window(handle)
-                    p_url = self._driver.current_url
-                    if "connect.garmin.com" in p_url and "sso.garmin.com" not in p_url:
-                        log.info("Found app in another tab: %s", p_url)
-                        url = p_url
-                        break
-                else:
-                    self._driver.switch_to.window(original)
-            if "connect.garmin.com" in url and "sso.garmin.com" not in url:
-                break
-
-            # MFA detection
-            is_mfa_page = "/mfa" in url.lower() or "verifymfa" in url.lower()
-            if not is_mfa_page and not mfa_prompted and "sso.garmin.com" in url:
-                try:
-                    has_mfa_input = self._driver.execute_script("""
-                        var inputs = document.querySelectorAll(
-                            'input[name="verificationCode"], input[name="securityCode"], input[type="tel"], '
-                            + 'input[placeholder*="code"], input[placeholder*="Code"], '
-                            + 'input[name="mfaCode"], input[autocomplete="one-time-code"]'
-                        );
-                        return inputs.length > 0;
-                    """)
-                    if has_mfa_input:
-                        is_mfa_page = True
-                        log.info("MFA input found on page (same URL)")
-                except Exception:
-                    pass
-
-            if not mfa_prompted and is_mfa_page:
-                mfa_prompted = True
-                log.info("MFA page detected: %s", url)
-
-                try:
-                    self._driver.execute_script("""
-                        var cb = document.querySelector(
-                            'input[name="remember"], input[id="remember"], input[type="checkbox"]'
-                        );
-                        if (cb && !cb.checked) cb.click();
-                    """)
-                except Exception:
-                    pass
-
-                if sys.stdin.isatty():
-                    import threading
-
-                    def _read_mfa():
-                        try:
-                            mfa_code_result[0] = input("  Enter MFA code: ").strip()
-                        except (EOFError, OSError):
-                            pass
-
-                    print()
-                    print("  MFA required!")
-                    print("  Enter code here OR in the browser window:")
-                    mfa_code_thread = threading.Thread(target=_read_mfa, daemon=True)
-                    mfa_code_thread.start()
-                else:
-                    print()
-                    print("  MFA required — enter code in the browser window...")
-
-            if mfa_prompted and poll % 15 == 0 and poll > 0:
-                print("  Still waiting for MFA code...")
-
-            if mfa_prompted and poll > 0 and poll % 30 == 0:
-                log.debug("Stuck on SSO after MFA — trying to navigate to app...")
-                try:
-                    self._driver.get(CONNECT_URL)
-                    time.sleep(2)
-                    url = self._driver.current_url
-                    if "connect.garmin.com" in url and "sso.garmin.com" not in url:
-                        log.info("Navigated to app after MFA: %s", url)
-                        break
-                except Exception as e:
-                    log.debug("Nav attempt error: %s", e)
-
-            if mfa_code_result[0] is not None:
-                code = mfa_code_result[0]
-                mfa_code_result[0] = None
-                log.info("MFA code from console (%d chars), submitting...", len(code))
-                self._submit_mfa_code(code)
-
-        # Wait for app to load
-        time.sleep(3)
-        log.debug("Final URL: %s", self._driver.current_url)
-
-        if self._is_on_login_page():
-            print(f"Login failed — still on login page: {self._driver.current_url}")
-            return False
-
-        print("Login successful!")
-        print("Setting up session...")
-        log.info("Login successful, URL: %s", self._driver.current_url)
-        self._save_session()
-        return self._post_login_setup()
-
-    def _submit_mfa_code(self, code: str) -> None:
-        """Type an MFA code into the browser and submit."""
-        mfa_selectors = [
-            'input[name="securityCode"]',
-            'input[name="verificationCode"]',
-            'input[type="tel"]',
-            'input[placeholder*="code"]',
-            'input[placeholder*="Code"]',
-            'input[name="mfaCode"]',
-            'input[autocomplete="one-time-code"]',
-        ]
-
-        time.sleep(1)
-        for sel in mfa_selectors:
-            try:
-                mfa_input = WebDriverWait(self._driver, 3).until(EC.presence_of_element_located((By.CSS_SELECTOR, sel)))
-                mfa_input.click()
-                mfa_input.clear()
-                mfa_input.send_keys(code)
-                log.info("MFA code filled via selector: %s", sel)
-
-                try:
-                    submit_btn = self._driver.find_element(
-                        By.CSS_SELECTOR,
-                        'button[type="submit"]',
-                    )
-                    submit_btn.click()
-                except Exception:
-                    mfa_input.send_keys(Keys.ENTER)
-
-                log.info("MFA code submitted via browser")
-                return
-            except Exception:
-                continue
-
-        log.warning("Could not find MFA input field to fill")
-
-    def _is_on_login_page(self) -> bool:
-        try:
-            url = self._driver.current_url.lower()
-        except Exception:
-            return True
-        if "connect.garmin.com" in url and "sso.garmin.com" not in url:
-            return False
-        return "sso.garmin.com" in url or "signin" in url or "sign-in" in url
-
-    # ── Post-login setup ─────────────────────────────────────────
-
-    def _post_login_setup(self) -> bool:
-        current = self._driver.current_url
-        if "/modern/" not in current:
-            log.debug("Navigating to /modern/ for CSRF (was on %s)", current)
-            try:
-                self._driver.get(CONNECT_URL)
-            except Exception:
-                pass
-            time.sleep(3)
-
-        setup = self._driver.execute_async_script("""
-            var callback = arguments[arguments.length - 1];
-            (async function() {
-                try {
-                    var csrf = document.querySelector(
-                        'meta[name="csrf-token"], meta[name="_csrf"]'
-                    )?.content;
-                    var h = {'connect-csrf-token': csrf};
-                    var resp = await fetch(
-                        '/gc-api/userprofile-service/socialProfile',
-                        {credentials: 'include', headers: h}
-                    );
-                    var profile = resp.status === 200 ? await resp.json() : null;
-                    return {csrf: csrf, displayName: profile ? profile.displayName : null};
-                } catch(e) {
-                    return {error: String(e)};
-                }
-            })().then(callback).catch(function(e) { callback({error: String(e)}); });
-        """)
-
-        self._csrf = setup.get("csrf") if setup else None
-        self._csrf_time = time.time() if self._csrf else 0
-        self._display_name = setup.get("displayName") if setup else None
-        if not self._csrf:
-            log.debug("Could not extract CSRF token")
-            return False
-        log.info("Display name: %s", self._display_name)
-        return True
-
-    def _ensure_csrf(self) -> Optional[str]:
-        """Re-read CSRF from page meta tag if stale."""
-        if self._csrf and time.time() - self._csrf_time < CSRF_TTL:
-            return self._csrf
-        self._ensure_on_garmin()
-        csrf = self._driver.execute_script(
-            'return document.querySelector(\'meta[name="csrf-token"], meta[name="_csrf"]\')?.content'
+                return input("  Enter MFA code: ").strip()
+            except (EOFError, OSError):
+                return None
+        log.error("MFA required but session is non-interactive (no TTY, no GARMIN_MFA_CODE)")
+        print(
+            "  MFA required, but this run is non-interactive.\n"
+            "  Run `garmin-givemydata` once in a terminal to complete MFA,\n"
+            "  or set GARMIN_MFA_CODE before syncing."
         )
-        if csrf:
-            self._csrf = csrf
-            self._csrf_time = time.time()
-        return self._csrf
+        return None
 
-    def _ensure_on_garmin(self) -> None:
-        """Make sure the browser is on connect.garmin.com for fetch context."""
+    # ── OAuth exchange ───────────────────────────────────────────
+
+    def _complete_oauth(self, ticket: str) -> None:
+        self._oauth1 = self._get_oauth1_token(ticket)
+        self._oauth2 = self._exchange_oauth2(self._oauth1, login=True)
+
+    def _get_oauth1_token(self, ticket: str) -> OAuth1Token:
+        consumer = self._ensure_consumer()
+        url = (
+            f"{CONNECTAPI_BASE}/oauth-service/oauth/preauthorized"
+            f"?ticket={ticket}&login-url={SERVICE_URL}&accepts-mfa-tokens=true"
+        )
+        header = oauth1_authorization_header("GET", url, consumer["consumer_key"], consumer["consumer_secret"])
+        resp = self._serial_session().get(
+            url,
+            headers={"User-Agent": OAUTH_USER_AGENT, "Authorization": header},
+            timeout=REQUEST_TIMEOUT,
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(f"OAuth1 preauthorized failed: HTTP {resp.status_code} {resp.text[:200]}")
+        parsed = {k: v[0] for k, v in parse_qs(resp.text).items()}
+        if "oauth_token" not in parsed or "oauth_token_secret" not in parsed:
+            raise RuntimeError(f"OAuth1 response missing tokens: {resp.text[:200]}")
+        return OAuth1Token(
+            oauth_token=parsed["oauth_token"],
+            oauth_token_secret=parsed["oauth_token_secret"],
+            mfa_token=parsed.get("mfa_token"),
+        )
+
+    def _exchange_oauth2(self, oauth1: OAuth1Token, login: bool = False) -> OAuth2Token:
+        consumer = self._ensure_consumer()
+        url = f"{CONNECTAPI_BASE}/oauth-service/oauth/exchange/user/2.0"
+        body: dict = {}
+        if login:
+            body["audience"] = "GARMIN_CONNECT_MOBILE_ANDROID_DI"
+        if oauth1.mfa_token:
+            body["mfa_token"] = oauth1.mfa_token
+        header = oauth1_authorization_header(
+            "POST",
+            url,
+            consumer["consumer_key"],
+            consumer["consumer_secret"],
+            token=oauth1.oauth_token,
+            token_secret=oauth1.oauth_token_secret,
+            body_params=body,
+        )
+        resp = self._serial_session().post(
+            url,
+            headers={
+                "User-Agent": OAUTH_USER_AGENT,
+                "Authorization": header,
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+            data=body,
+            timeout=REQUEST_TIMEOUT,
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(f"OAuth2 exchange failed: HTTP {resp.status_code} {resp.text[:200]}")
+        token = resp.json()
+        now = int(time.time())
+        token["expires_at"] = now + int(token.get("expires_in", 0))
+        token["refresh_token_expires_at"] = now + int(token.get("refresh_token_expires_in", 0))
+        known = OAuth2Token.__dataclass_fields__.keys()
+        return OAuth2Token(**{k: v for k, v in token.items() if k in known})
+
+    def _ensure_oauth2(self) -> bool:
+        """Make sure a valid OAuth2 bearer token is available, refreshing
+        from the OAuth1 token when expired. Returns False if not logged in."""
+        if self._oauth2 and not self._oauth2.expired:
+            return True
+        if not self._oauth1:
+            return False
         try:
-            current = self._driver.current_url
+            self._oauth2 = self._exchange_oauth2(self._oauth1, login=False)
+            self._save_tokens()
+            log.info("Refreshed OAuth2 token")
+            return True
+        except Exception as e:
+            log.warning("OAuth2 refresh failed: %s", e)
+            return False
+
+    def _fetch_display_name(self) -> bool:
+        data = self.api_fetch("/gc-api/userprofile-service/socialProfile")
+        if isinstance(data, dict) and data.get("displayName"):
+            self._display_name = data["displayName"]
+            log.info("Display name: %s", self._display_name)
+            return True
+        return False
+
+    # ── URL / response helpers ───────────────────────────────────
+
+    @staticmethod
+    def _api_url(api_path: str) -> str:
+        """Translate a web ``/gc-api/<service>/...`` path to its
+        ``connectapi.garmin.com/<service>/...`` equivalent."""
+        if api_path.startswith("http://") or api_path.startswith("https://"):
+            return api_path
+        path = api_path
+        if path.startswith("/gc-api/"):
+            path = path[len("/gc-api") :]
+        elif path.startswith("gc-api/"):
+            path = "/" + path[len("gc-api/") :]
+        if not path.startswith("/"):
+            path = "/" + path
+        return CONNECTAPI_BASE + path
+
+    @staticmethod
+    def _json_or_none(resp):
+        try:
+            return resp.json()
         except Exception:
-            return
-        if "connect.garmin.com" not in current or "sso.garmin.com" in current:
-            self._driver.get(CONNECT_URL)
-            time.sleep(2)
+            return None
 
     # ── Public API ───────────────────────────────────────────────
 
     def navigate(self, url: str) -> None:
-        """Navigate the browser to a URL (same-origin, no CF challenge expected)."""
-        self._driver.get(url)
-        time.sleep(2)
+        """No-op kept for backward compatibility (there is no browser)."""
+        return None
 
     def api_fetch(self, api_path: str):
-        """Fetch JSON from a /gc-api endpoint via the browser context.
-
-        Returns the parsed JSON or None on failure.
-        """
-        self._ensure_on_garmin()
-        csrf = self._ensure_csrf()
-        return self._driver.execute_async_script(
-            """
-            var callback = arguments[arguments.length - 1];
-            var url = arguments[0];
-            var csrf = arguments[1];
-            (async function() {
-                try {
-                    var resp = await fetch(url, {
-                        credentials: 'include',
-                        headers: {'connect-csrf-token': csrf || '', 'Accept': 'application/json'}
-                    });
-                    if (resp.status !== 200) return null;
-                    return await resp.json();
-                } catch(e) { return null; }
-            })().then(callback).catch(function() { callback(null); });
-        """,
-            api_path,
-            csrf,
-        )
+        """Fetch JSON from a ``/gc-api`` endpoint. Returns parsed JSON or None."""
+        if not self._ensure_oauth2():
+            return None
+        try:
+            resp = self._serial_session().get(
+                self._api_url(api_path), headers=self._auth_headers(), timeout=REQUEST_TIMEOUT
+            )
+            if resp.status_code != 200:
+                return None
+            return self._json_or_none(resp)
+        except Exception as e:
+            log.debug("api_fetch error for %s: %s", api_path, e)
+            return None
 
     def download_file(self, api_path: str) -> Optional[bytes]:
-        """Download a binary file from a /gc-api endpoint. Returns bytes or None."""
-        self._ensure_on_garmin()
-        csrf = self._ensure_csrf()
-        result = self._driver.execute_async_script(
-            """
-            var callback = arguments[arguments.length - 1];
-            var url = arguments[0];
-            var csrf = arguments[1];
-            (async function() {
-                try {
-                    var resp = await fetch(url, {
-                        credentials: 'include',
-                        headers: {'connect-csrf-token': csrf || ''}
-                    });
-                    if (resp.status !== 200) return {status: resp.status};
-                    var buffer = await resp.arrayBuffer();
-                    return {status: 200, data: Array.from(new Uint8Array(buffer))};
-                } catch(e) { return {status: 'error'}; }
-            })().then(callback).catch(function() { callback({status: 'error'}); });
-        """,
-            api_path,
-            csrf,
-        )
-        if result and result.get("status") == 200 and result.get("data"):
-            return bytes(result["data"])
-        return None
+        """Download a binary file from a ``/gc-api`` endpoint. Returns bytes or None."""
+        if not self._ensure_oauth2():
+            return None
+        try:
+            resp = self._serial_session().get(
+                self._api_url(api_path), headers=self._auth_headers(), timeout=DOWNLOAD_TIMEOUT
+            )
+            if resp.status_code == 200 and resp.content:
+                return resp.content
+            return None
+        except Exception as e:
+            log.debug("download_file error for %s: %s", api_path, e)
+            return None
 
     # ── Save raw debug data ─────────────────────────────────────
 
     def _save_raw(self, name: str, data):
-        """Save raw JSON response under the ``debug/raw`` directory (next to browser_profile)."""
+        """Save raw JSON response under the ``debug/raw`` directory (next to the token cache)."""
         if not self.profile_dir:
             return
         raw_dir = self.profile_dir.parent / "debug" / "raw"
@@ -792,71 +687,66 @@ class GarminClient:
 
     # ── Batch fetching ───────────────────────────────────────────
 
+    def _get_pool(self):
+        if self._pool is None:
+            from concurrent.futures import ThreadPoolExecutor
+
+            self._pool = ThreadPoolExecutor(max_workers=DEFAULT_CONCURRENCY, thread_name_prefix="garmin-fetch")
+        return self._pool
+
+    def _fetch_one_rest(self, name: str, api_path: str, headers: dict):
+        try:
+            resp = self._pool_session().get(self._api_url(api_path), headers=headers, timeout=REQUEST_TIMEOUT)
+            if resp.status_code == 200:
+                data = self._json_or_none(resp)
+                if data is None:
+                    data = resp.text
+                return name, {"status": 200, "data": data}
+            return name, {"status": resp.status_code, "data": None}
+        except Exception as e:
+            return name, {"status": "error", "data": str(e)}
+
+    def _fetch_one_gql(self, name: str, query: str, headers: dict):
+        key = "gql_" + name
+        try:
+            resp = self._pool_session().post(
+                GRAPHQL_URL,
+                headers={**headers, "Content-Type": "application/json"},
+                json={"query": query},
+                timeout=REQUEST_TIMEOUT,
+            )
+            if resp.status_code == 200:
+                return key, {"status": 200, "data": self._json_or_none(resp)}
+            return key, {"status": resp.status_code, "data": None}
+        except Exception as e:
+            return key, {"status": "error", "data": str(e)}
+
     def _fetch_batch(self, rest: dict, gql: dict) -> dict:
-        """Fetch a batch of REST + GraphQL endpoints in parallel via browser."""
-        self._ensure_on_garmin()
-        csrf = self._ensure_csrf()
+        """Fetch a batch of REST + GraphQL endpoints in parallel.
 
-        rest_entries = list(rest.items())
-        gql_entries = list(gql.items())
-
-        result = self._driver.execute_async_script(
-            """
-            var callback = arguments[arguments.length - 1];
-            var csrf = arguments[0];
-            var restEntries = arguments[1];
-            var gqlEntries = arguments[2];
-
-            (async function() {
-                var h = {'connect-csrf-token': csrf, 'Accept': 'application/json'};
-
-                async function get(url) {
-                    try {
-                        var resp = await fetch(url, {credentials:'include', headers: h});
-                        if (resp.status === 200) {
-                            var text = await resp.text();
-                            try { return {status: 200, data: JSON.parse(text)}; }
-                            catch(e) { return {status: 200, data: text}; }
-                        }
-                        return {status: resp.status, data: null};
-                    } catch(e) { return {status: 'error', data: e.message}; }
-                }
-
-                async function gql(query) {
-                    try {
-                        var resp = await fetch('/gc-api/graphql-gateway/graphql', {
-                            method: 'POST',
-                            credentials: 'include',
-                            headers: Object.assign({}, h, {'Content-Type': 'application/json'}),
-                            body: JSON.stringify({query: query})
-                        });
-                        if (resp.status === 200) return {status: 200, data: await resp.json()};
-                        return {status: resp.status, data: null};
-                    } catch(e) { return {status: 'error', data: e.message}; }
-                }
-
-                var promises = restEntries.map(function(entry) {
-                    return get(entry[1]).then(function(r) { return [entry[0], r]; });
-                }).concat(gqlEntries.map(function(entry) {
-                    return gql(entry[1]).then(function(r) { return ['gql_' + entry[0], r]; });
-                }));
-
-                var results = await Promise.all(promises);
-                var output = {};
-                for (var i = 0; i < results.length; i++) {
-                    output[results[i][0]] = results[i][1];
-                }
-                return output;
-            })().then(callback).catch(function(e) { callback({error: String(e)}); });
-        """,
-            csrf,
-            rest_entries,
-            gql_entries,
-        )
-
-        if result and "error" in result:
-            log.warning("_fetch_batch JS error: %s", result["error"])
+        Returns ``{name: {"status": ..., "data": ...}}`` — REST results keyed
+        by their name, GraphQL results keyed by ``gql_<name>`` (the contract
+        ``save_to_db`` relies on).
+        """
+        if not self._ensure_oauth2():
+            log.warning("_fetch_batch: no valid token")
             return {}
+
+        headers = self._auth_headers()
+        pool = self._get_pool()
+        futures = []
+        for name, api_path in rest.items():
+            futures.append(pool.submit(self._fetch_one_rest, name, api_path, headers))
+        for name, query in gql.items():
+            futures.append(pool.submit(self._fetch_one_gql, name, query, headers))
+
+        result: dict = {}
+        for fut in futures:
+            try:
+                key, value = fut.result()
+                result[key] = value
+            except Exception as e:
+                log.debug("batch task error: %s", e)
 
         # Save raw payloads and failures for later replay/debugging.
         if self._save_raw_enabled and result:
@@ -866,7 +756,7 @@ class GarminClient:
                 else:
                     self._save_raw(name, res)
 
-        return result or {}
+        return result
 
     def _date_chunks(self, start: str, end: str, max_days: int = 28) -> list:
         """Split a date range into chunks of max_days."""
@@ -900,7 +790,7 @@ class GarminClient:
             These will be skipped during per-activity detail fetching.
         save_raw : bool, default False
             Whether to save raw JSON responses under the ``debug/raw`` directory
-            (next to ``browser_profile``).
+            (next to the token cache).
         """
         self._save_raw_enabled = save_raw
         today = target_date or date.today().isoformat()
@@ -1125,14 +1015,31 @@ class GarminClient:
     # ── Shutdown ─────────────────────────────────────────────────
 
     def close(self):
-        if self._driver is not None:
+        # Persist whatever tokens we ended up with (e.g. after a refresh).
+        try:
+            self._save_tokens()
+        except Exception:
+            pass
+        if self._pool is not None:
             try:
-                self._driver.quit()
-            except Exception as e:
-                log.debug("driver.quit() error: %s", e)
-            self._driver = None
-        self._write_sentinel()
-        self._stop_xvfb()
+                self._pool.shutdown(wait=False)
+            except Exception:
+                pass
+            self._pool = None
+        with self._pool_sessions_lock:
+            sessions = list(self._pool_sessions)
+            self._pool_sessions.clear()
+        for s in sessions:
+            try:
+                s.close()
+            except Exception:
+                pass
+        if self._session is not None:
+            try:
+                self._session.close()
+            except Exception:
+                pass
+            self._session = None
 
 
 # ─── Utility functions ───────────────────────────────────────────
