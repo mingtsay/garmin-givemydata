@@ -100,7 +100,7 @@ def get_db_status() -> dict:
     """Check the database: does it exist, how much data, last sync date."""
     db_path = DATA_DIR / "garmin.db"
     if not db_path.exists():
-        return {"exists": False, "rows": 0, "last_date": None, "first_date": None}
+        return {"exists": False, "rows": 0, "last_date": None, "first_date": None, "last_sync_end": None}
 
     conn = get_connection()
     init_db(conn)
@@ -111,7 +111,19 @@ def get_db_status() -> dict:
             conn,
             "SELECT MIN(calendar_date) as d FROM daily_summary WHERE total_steps IS NOT NULL",
         )[0]["d"]
-        return {"exists": True, "rows": rows, "last_date": last, "first_date": first}
+        # Explicit coverage end from the last successful sync (None on older DBs).
+        sync_end = db_query(
+            conn,
+            "SELECT data_end as d FROM sync_log WHERE data_end IS NOT NULL ORDER BY id DESC LIMIT 1",
+        )
+        last_sync_end = sync_end[0]["d"] if sync_end else None
+        return {
+            "exists": True,
+            "rows": rows,
+            "last_date": last,
+            "first_date": first,
+            "last_sync_end": last_sync_end,
+        }
     finally:
         conn.close()
 
@@ -122,8 +134,15 @@ def fetch_direct_to_db(
     start_date: str,
     end_date: str,
     save_raw: bool = False,
+    stop_after_empty_days: int | None = None,
 ) -> None:
-    """Fetch data and save each batch directly to SQLite."""
+    """Fetch data and save each batch directly to SQLite.
+
+    When ``stop_after_empty_days`` is set, the backward historical walk stops
+    once that many consecutive days have returned no data — typically the void
+    before the account existed. Left as None (the default), the full window is
+    fetched even across empty years.
+    """
     counts = {}
 
     # Get activity IDs that already have detail data (splits/weather/HR zones)
@@ -171,6 +190,7 @@ def fetch_direct_to_db(
         # Chunk into yearly segments (most recent first)
         year_num = 0
         cursor = e
+        empty_run_days = 0
         while cursor > s:
             chunk_start = max(s, cursor - timedelta(days=365))
             chunk_end = cursor
@@ -179,7 +199,12 @@ def fetch_direct_to_db(
             pct = int(year_num / total_chunks * 100)
             print(f"\n[{pct:3d}%] Year {year_num}/{total_chunks}: {chunk_start.isoformat()} to {chunk_end.isoformat()}")
 
-            prev_total = sum(counts.values())
+            # daily_summary is the reliable "did this period have data" signal:
+            # its row count only grows for days Garmin actually recorded (empty
+            # placeholder days are filtered out at write time). Other endpoints
+            # (e.g. error-returning ones) can still add rows on void days, so we
+            # must not key the stop decision on the overall total.
+            prev_ds = counts.get("daily_summary", 0)
             client.fetch_all(
                 target_date=chunk_end.isoformat(),
                 start_date=chunk_start.isoformat(),
@@ -188,11 +213,15 @@ def fetch_direct_to_db(
                 known_activity_ids=known_activity_ids,
                 save_raw=save_raw,
             )
+            chunk_days = (chunk_end - chunk_start).days + 1
 
-            new_total = sum(counts.values())
-            if new_total == prev_total:
-                print("  No data in this chunk, stopping.")
-                break
+            if counts.get("daily_summary", 0) == prev_ds:
+                empty_run_days += chunk_days
+                if stop_after_empty_days is not None and empty_run_days >= stop_after_empty_days:
+                    print(f"  No data for {empty_run_days}+ consecutive days, stopping early.")
+                    break
+            else:
+                empty_run_days = 0
 
             cursor = chunk_start - timedelta(days=1)
 
@@ -252,12 +281,13 @@ def _print_trackpoint_summary(summary: dict[str, int], prefix: str = "") -> None
     )
 
 
-def _log_sync(conn, sync_type, count):
+def _log_sync(conn, sync_type, count, data_start=None, data_end=None):
     from datetime import datetime, timezone
 
     conn.execute(
-        "INSERT INTO sync_log (sync_date, sync_type, records_upserted, status) VALUES (?, ?, ?, ?)",
-        (datetime.now(timezone.utc).isoformat(), sync_type, count, "ok"),
+        "INSERT INTO sync_log (sync_date, sync_type, records_upserted, status, data_start, data_end) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (datetime.now(timezone.utc).isoformat(), sync_type, count, "ok", data_start, data_end),
     )
     conn.commit()
 
@@ -306,6 +336,26 @@ examples:
     fetch_group.add_argument("--full", action="store_true", help="Force full historical fetch")
     fetch_group.add_argument("--days", type=int, help="Fetch last N days")
     fetch_group.add_argument("--since", type=str, help="Fetch from date (YYYY-MM-DD)")
+    fetch_group.add_argument(
+        "--overlap-days",
+        type=int,
+        default=7,
+        metavar="N",
+        help="Incremental sync re-fetches this many days before the last synced "
+        "date to catch late-arriving or revised data, e.g. sleep finalised the "
+        "next morning (default: 7)",
+    )
+    fetch_group.add_argument(
+        "--stop-after-empty",
+        type=int,
+        nargs="?",
+        const=365,
+        default=None,
+        metavar="DAYS",
+        help="During a full historical fetch, stop walking backwards once this "
+        "many consecutive days return no data (default when given: 365). Off by "
+        "default — a full fetch otherwise tries the entire 10-year window.",
+    )
     fetch_group.add_argument(
         "--save-raw", action="store_true", help="Save raw JSON responses to debug/raw for debugging"
     )
@@ -506,12 +556,15 @@ examples:
             print("No existing data found. Running full historical fetch...")
     else:
         mode = "incremental"
-        last = date.fromisoformat(status["last_date"])
-        start = (last - timedelta(days=1)).isoformat()
+        # Anchor on the explicitly recorded coverage end; fall back to the last
+        # day with data for DBs synced before coverage was tracked. Overlap a
+        # few days so late-arriving / revised data gets picked up (idempotent).
+        anchor = date.fromisoformat(status.get("last_sync_end") or status["last_date"])
+        overlap = max(0, args.overlap_days)
+        start = (anchor - timedelta(days=overlap)).isoformat()
         end = today.isoformat()
-        gap_days = (today - last).days
-        print(f"Database has data through {status['last_date']} ({status['rows']} daily records)")
-        print(f"Fetching {gap_days + 1} days: {start} to {end}")
+        print(f"Database has data through {anchor.isoformat()} ({status['rows']} daily records)")
+        print(f"Incremental sync with {overlap}-day overlap: {start} to {end}")
 
     # ── FIT-only mode ─────────────────────────────────────
     if args.fit_only:
@@ -612,7 +665,14 @@ examples:
             print("Login failed!")
             sys.exit(1)
 
-        fetch_direct_to_db(client, conn, start, end, save_raw=args.save_raw)
+        fetch_direct_to_db(
+            client,
+            conn,
+            start,
+            end,
+            save_raw=args.save_raw,
+            stop_after_empty_days=args.stop_after_empty,
+        )
 
         # Report actual row counts from the database (not upsert operations)
         tables = db_query(
@@ -629,7 +689,7 @@ examples:
                 total += row_count
         print(f"  Total: {total} rows")
 
-        _log_sync(conn, "garmin_givemydata", total)
+        _log_sync(conn, "garmin_givemydata", total, data_start=start, data_end=end)
 
         # Download FIT files for activities (unless --no-files)
         if not args.no_files and profile in ("all", "activities"):
