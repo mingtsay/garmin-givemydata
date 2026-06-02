@@ -638,8 +638,13 @@ class GarminClient:
         if not self._ensure_oauth2():
             return None
         try:
+            # Binary download endpoints (e.g. download-service) reject the
+            # default ``Accept: application/json`` with HTTP 406. Ask for any
+            # type so the server returns the raw FIT/ZIP payload.
+            headers = self._auth_headers()
+            headers["Accept"] = "*/*"
             resp = self._serial_session().get(
-                self._api_url(api_path), headers=self._auth_headers(), timeout=DOWNLOAD_TIMEOUT
+                self._api_url(api_path), headers=headers, timeout=DOWNLOAD_TIMEOUT
             )
             if resp.status_code == 200 and resp.content:
                 return resp.content
