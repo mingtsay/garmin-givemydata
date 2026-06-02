@@ -1539,6 +1539,10 @@ def upsert_running_dynamics(conn: sqlite3.Connection, aid: int, record: dict) ->
 
 
 def upsert_daily_summary(conn: sqlite3.Connection, record: dict) -> None:
+    # A daily summary is keyed by its date; without one the row is unqueryable
+    # junk (calendar_date NULL) and only pollutes the table. Skip it.
+    if not (record.get("calendarDate") or "").strip():
+        return
     conn.execute(
         """
         INSERT OR REPLACE INTO daily_summary (
